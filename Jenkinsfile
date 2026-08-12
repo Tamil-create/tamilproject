@@ -1,45 +1,40 @@
+// Employee Management System - ECS CI/CD Jenkinsfile
+// Flow: GitHub -> Webhook -> Jenkins -> Build/Test -> Docker -> ECR -> ECS
+// IMPORTANT: Verify ECS_BACKEND_SERVICE, ECS_FRONTEND_SERVICE and the container
+// names against the actual ECS service/task definitions before running.
+
 pipeline {
     agent any
 
     environment {
         AWS_REGION = 'us-east-1'
         ECR_REGISTRY = credentials('ecr-registry-url')
-        EKS_CLUSTER_NAME = 'employee-management-eks'
+        ECS_CLUSTER_NAME = 'employee-management-cluster'
+        ECS_BACKEND_SERVICE = "${params.ECS_BACKEND_SERVICE ?: 'backend-service'}"
+        ECS_FRONTEND_SERVICE = "${params.ECS_FRONTEND_SERVICE ?: 'frontend-service'}"
+        ECS_BACKEND_CONTAINER = 'backend'
+        ECS_FRONTEND_CONTAINER = 'frontend'
         DOCKER_BUILDKIT = '1'
         IMAGE_TAG = "${env.GIT_COMMIT.take(8)}"
         BACKEND_IMAGE = "${ECR_REGISTRY}/employee-management-backend:${IMAGE_TAG}"
         FRONTEND_IMAGE = "${ECR_REGISTRY}/employee-management-frontend:${IMAGE_TAG}"
-        KUBECONFIG = "${WORKSPACE}/.kube/config"
-        DEPLOYMENT_STRATEGY = "${params.DEPLOYMENT_STRATEGY ?: 'rolling'}"
-        ACTIVE_VERSION = "${params.ACTIVE_VERSION ?: 'blue'}"
-        CANARY_WEIGHT = "${params.CANARY_WEIGHT ?: '10'}"
     }
 
     parameters {
-        choice(
-            name: 'DEPLOYMENT_STRATEGY',
-            choices: ['rolling', 'blue-green', 'canary'],
-            description: 'Choose deployment strategy'
-        )
-        choice(
-            name: 'ACTIVE_VERSION',
-            choices: ['blue', 'green'],
-            description: 'Currently active version (for blue-green deployment)'
-        )
-        string(
-            name: 'CANARY_WEIGHT',
-            defaultValue: '10',
-            description: 'Percentage of traffic to canary (1-100)'
-        )
         booleanParam(
             name: 'SKIP_TESTS',
             defaultValue: false,
             description: 'Skip running tests'
         )
-        booleanParam(
-            name: 'AUTO_ROLLBACK',
-            defaultValue: true,
-            description: 'Automatically rollback on deployment failure'
+        string(
+            name: 'ECS_BACKEND_SERVICE',
+            defaultValue: 'backend-service',
+            description: 'ECS backend service name'
+        )
+        string(
+            name: 'ECS_FRONTEND_SERVICE',
+            defaultValue: 'frontend-service',
+            description: 'ECS frontend service name'
         )
     }
 
@@ -60,7 +55,7 @@ pipeline {
                     echo "Build Number: ${env.BUILD_NUMBER}"
                     echo "Git Commit: ${env.GIT_COMMIT}"
                     echo "Git Branch: ${env.GIT_BRANCH}"
-                    echo "Deployment Strategy: ${DEPLOYMENT_STRATEGY}"
+                    echo "ECS Cluster: ${ECS_CLUSTER_NAME}"
                     echo "Image Tag: ${IMAGE_TAG}"
                     echo "========================================="
 
@@ -263,89 +258,115 @@ pipeline {
             }
         }
 
-        stage('Configure Kubectl') {
+        stage('Deploy to ECS') {
             steps {
                 script {
-                    echo 'Configuring kubectl for EKS...'
+                    echo "Deploying version ${IMAGE_TAG} to ECS cluster ${ECS_CLUSTER_NAME}"
                     sh """
-                        mkdir -p ${WORKSPACE}/.kube
-                        aws eks update-kubeconfig \
-                            --region ${AWS_REGION} \
-                            --name ${EKS_CLUSTER_NAME} \
-                            --kubeconfig ${KUBECONFIG}
+                        set -e
 
-                        kubectl version --client
-                        kubectl cluster-info
+                        deploy_ecs_service() {
+                            SERVICE=\$1
+                            CONTAINER=\$2
+                            NEW_IMAGE=\$3
+                            FILE=\$4
+
+                            echo "Preparing ECS service: \${SERVICE}"
+
+                            CURRENT_TASK_DEF=\$(aws ecs describe-services \\
+                                --cluster ${ECS_CLUSTER_NAME} \\
+                                --services "\${SERVICE}" \\
+                                --region ${AWS_REGION} \\
+                                --query 'services[0].taskDefinition' \\
+                                --output text)
+
+                            if [ "\${CURRENT_TASK_DEF}" = "None" ] || [ -z "\${CURRENT_TASK_DEF}" ]; then
+                                echo "ERROR: ECS service \${SERVICE} was not found."
+                                exit 1
+                            fi
+
+                            echo "Current task definition: \${CURRENT_TASK_DEF}"
+
+                            aws ecs describe-task-definition \\
+                                --task-definition "\${CURRENT_TASK_DEF}" \\
+                                --region ${AWS_REGION} \\
+                                --query 'taskDefinition' > "\${FILE}.source.json"
+
+                            jq --arg IMAGE "\${NEW_IMAGE}" --arg CONTAINER "\${CONTAINER}" '
+                                if any(.containerDefinitions[]; .name == $CONTAINER)
+                                then del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
+                                     | .containerDefinitions |= map(if .name == $CONTAINER then .image = $IMAGE else . end)
+                                else error("Container name not found in task definition")
+                                end
+                            ' "\${FILE}.source.json" > "\${FILE}.json"
+
+                            NEW_TASK_DEF=\$(aws ecs register-task-definition \\
+                                --cli-input-json file://"\${FILE}.json" \\
+                                --region ${AWS_REGION} \\
+                                --query 'taskDefinition.taskDefinitionArn' \\
+                                --output text)
+
+                            echo "Registered task definition: \${NEW_TASK_DEF}"
+
+                            aws ecs update-service \\
+                                --cluster ${ECS_CLUSTER_NAME} \\
+                                --service "\${SERVICE}" \\
+                                --task-definition "\${NEW_TASK_DEF}" \\
+                                --region ${AWS_REGION} \\
+                                --query 'service.serviceName' \\
+                                --output text
+
+                            echo "\${NEW_TASK_DEF}" > "\${FILE}.new-td"
+                        }
+
+                        deploy_ecs_service \\
+                            "${ECS_BACKEND_SERVICE}" \\
+                            "${ECS_BACKEND_CONTAINER}" \\
+                            "${BACKEND_IMAGE}" \\
+                            "/tmp/backend-task-definition"
+
+                        deploy_ecs_service \\
+                            "${ECS_FRONTEND_SERVICE}" \\
+                            "${ECS_FRONTEND_CONTAINER}" \\
+                            "${FRONTEND_IMAGE}" \\
+                            "/tmp/frontend-task-definition"
+
+                        echo "Waiting for ECS services to become stable..."
+                        aws ecs wait services-stable \\
+                            --cluster ${ECS_CLUSTER_NAME} \\
+                            --services ${ECS_BACKEND_SERVICE} ${ECS_FRONTEND_SERVICE} \\
+                            --region ${AWS_REGION}
                     """
                 }
             }
         }
 
-        stage('Deploy to Kubernetes') {
+        stage('Post-Deployment Verification') {
             steps {
-                script {
-                    echo "Deploying with strategy: ${DEPLOYMENT_STRATEGY}"
+                sh """
+                    echo "Checking ECS service status..."
 
-                    switch(DEPLOYMENT_STRATEGY) {
-                        case 'blue-green':
-                            deployBlueGreen()
-                            break
-                        case 'canary':
-                            deployCanary()
-                            break
-                        case 'rolling':
-                        default:
-                            deployRolling()
-                            break
-                    }
-                }
-            }
-        }
+                    aws ecs describe-services \\
+                        --cluster ${ECS_CLUSTER_NAME} \\
+                        --services ${ECS_BACKEND_SERVICE} ${ECS_FRONTEND_SERVICE} \\
+                        --region ${AWS_REGION} \\
+                        --query 'services[].{Service:serviceName,Status:status,Desired:desiredCount,Running:runningCount,Pending:pendingCount}' \\
+                        --output table
 
-        stage('Post-Deployment Tests') {
-            steps {
-                script {
-                    echo 'Running smoke tests...'
-                    sh '''
-                        # Wait for deployments to be ready
-                        kubectl wait --for=condition=available --timeout=300s \
-                            deployment -l app=backend || true
-                        kubectl wait --for=condition=available --timeout=300s \
-                            deployment -l app=frontend || true
+                    echo "Running backend tasks:"
+                    aws ecs list-tasks \\
+                        --cluster ${ECS_CLUSTER_NAME} \\
+                        --service-name ${ECS_BACKEND_SERVICE} \\
+                        --region ${AWS_REGION} \\
+                        --desired-status RUNNING
 
-                        # Get service endpoints
-                        BACKEND_URL=$(kubectl get svc backend-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "backend-service")
-                        FRONTEND_URL=$(kubectl get svc frontend-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' || echo "frontend-service")
-
-                        echo "Backend URL: http://${BACKEND_URL}:3000"
-                        echo "Frontend URL: http://${FRONTEND_URL}"
-
-                        # Basic health checks
-                        sleep 30
-                        kubectl get pods -l app=backend
-                        kubectl get pods -l app=frontend
-                    '''
-                }
-            }
-        }
-
-        stage('Monitor Deployment') {
-            steps {
-                script {
-                    echo 'Monitoring deployment health...'
-                    sh '''
-                        # Check pod status
-                        kubectl get pods -l app=backend -o wide
-                        kubectl get pods -l app=frontend -o wide
-
-                        # Check recent events
-                        kubectl get events --sort-by=.metadata.creationTimestamp | tail -20
-
-                        # Display deployment status
-                        kubectl rollout status deployment -l app=backend --timeout=300s
-                        kubectl rollout status deployment -l app=frontend --timeout=300s
-                    '''
-                }
+                    echo "Running frontend tasks:"
+                    aws ecs list-tasks \\
+                        --cluster ${ECS_CLUSTER_NAME} \\
+                        --service-name ${ECS_FRONTEND_SERVICE} \\
+                        --region ${AWS_REGION} \\
+                        --desired-status RUNNING
+                """
             }
         }
     }
@@ -373,192 +394,23 @@ pipeline {
                     echo "========================================="
                     echo "Deployment Summary"
                     echo "========================================="
-                    echo "Strategy: ${DEPLOYMENT_STRATEGY}"
+                    echo "ECS Cluster: ${ECS_CLUSTER_NAME}"
                     echo "Backend Image: ${BACKEND_IMAGE}"
                     echo "Frontend Image: ${FRONTEND_IMAGE}"
                     echo "========================================="
 
-                    kubectl get deployments -l environment=production
-                    kubectl get services -l environment=production
+                    aws ecs describe-services \
+                        --cluster ${ECS_CLUSTER_NAME} \
+                        --services ${ECS_BACKEND_SERVICE} ${ECS_FRONTEND_SERVICE} \
+                        --region ${AWS_REGION} \
+                        --query 'services[].{Service:serviceName,Status:status,Desired:desiredCount,Running:runningCount}' \
+                        --output table
                 '''
             }
         }
         failure {
             echo 'Pipeline failed!'
-            script {
-                if (params.AUTO_ROLLBACK) {
-                    echo 'Attempting automatic rollback...'
-                    sh '''
-                        kubectl rollout undo deployment -l app=backend || true
-                        kubectl rollout undo deployment -l app=frontend || true
-
-                        echo "Rollback initiated. Check cluster status:"
-                        kubectl get pods -l environment=production
-                    '''
-                }
-            }
+            echo 'Check the Jenkins console log and ECS service events for the failed deployment.'
         }
     }
-}
-
-// Deployment Strategy Functions
-
-def deployRolling() {
-    echo 'Executing Rolling Deployment...'
-    sh """
-        # Update image tags in manifests
-        cd kubernetes
-
-        # Apply ConfigMaps and Secrets
-        kubectl apply -f configmap-production.yaml
-        kubectl apply -f rbac.yaml
-
-        # Update deployments with new images
-        kubectl set image deployment/backend-deployment \
-            backend=${BACKEND_IMAGE} --record
-        kubectl set image deployment/frontend-deployment \
-            frontend=${FRONTEND_IMAGE} --record
-
-        # Wait for rollout
-        kubectl rollout status deployment/backend-deployment --timeout=300s
-        kubectl rollout status deployment/frontend-deployment --timeout=300s
-
-        echo 'Rolling deployment completed successfully'
-    """
-}
-
-def deployBlueGreen() {
-    echo "Executing Blue-Green Deployment (Active: ${ACTIVE_VERSION})..."
-
-    def targetVersion = (ACTIVE_VERSION == 'blue') ? 'green' : 'blue'
-    echo "Deploying to ${targetVersion} environment..."
-
-    sh """
-        cd kubernetes
-
-        # Apply base resources
-        kubectl apply -f configmap-production.yaml
-        kubectl apply -f rbac.yaml
-        kubectl apply -f hpa.yaml
-        kubectl apply -f pdb.yaml
-        kubectl apply -f network-policy.yaml
-
-        # Deploy to target environment
-        export IMAGE_TAG=${IMAGE_TAG}
-        export ECR_REGISTRY=${ECR_REGISTRY}
-
-        envsubst < backend-deployment-${targetVersion}.yaml | kubectl apply -f -
-        envsubst < frontend-deployment-${targetVersion}.yaml | kubectl apply -f -
-
-        # Wait for new version to be ready
-        kubectl wait --for=condition=available --timeout=300s \
-            deployment/backend-deployment-${targetVersion}
-        kubectl wait --for=condition=available --timeout=300s \
-            deployment/frontend-deployment-${targetVersion}
-
-        # Run health checks on new version
-        sleep 30
-        NEW_BACKEND_READY=\$(kubectl get deployment backend-deployment-${targetVersion} -o jsonpath='{.status.readyReplicas}')
-        NEW_FRONTEND_READY=\$(kubectl get deployment frontend-deployment-${targetVersion} -o jsonpath='{.status.readyReplicas}')
-
-        echo "Backend ${targetVersion} ready replicas: \${NEW_BACKEND_READY}"
-        echo "Frontend ${targetVersion} ready replicas: \${NEW_FRONTEND_READY}"
-
-        if [ "\${NEW_BACKEND_READY}" -lt "1" ] || [ "\${NEW_FRONTEND_READY}" -lt "1" ]; then
-            echo "ERROR: New version is not ready!"
-            exit 1
-        fi
-
-        echo "New version is healthy. Ready for traffic switch."
-        echo "To switch traffic, run: ./scripts/switch-blue-green.sh ${targetVersion}"
-    """
-
-    // Prompt for manual approval before switching traffic
-    input message: "Deploy to ${targetVersion} completed. Switch traffic to ${targetVersion}?", ok: 'Switch Traffic'
-
-    sh """
-        # Switch traffic to new version
-        kubectl patch service backend-service -p '{"spec":{"selector":{"version":"${targetVersion}"}}}'
-        kubectl patch service frontend-service -p '{"spec":{"selector":{"version":"${targetVersion}"}}}'
-
-        echo "Traffic switched to ${targetVersion}"
-        echo "Previous version (${ACTIVE_VERSION}) is still running for rollback if needed"
-
-        # Scale down old version (optional, can keep for quick rollback)
-        # kubectl scale deployment/backend-deployment-${ACTIVE_VERSION} --replicas=1
-        # kubectl scale deployment/frontend-deployment-${ACTIVE_VERSION} --replicas=1
-    """
-}
-
-def deployCanary() {
-    echo "Executing Canary Deployment (${CANARY_WEIGHT}% traffic)..."
-
-    sh """
-        cd kubernetes
-
-        # Apply base resources
-        kubectl apply -f configmap-production.yaml
-        kubectl apply -f rbac.yaml
-        kubectl apply -f network-policy.yaml
-
-        # Deploy canary version
-        export IMAGE_TAG=${IMAGE_TAG}
-        export ECR_REGISTRY=${ECR_REGISTRY}
-
-        envsubst < backend-deployment-canary.yaml | kubectl apply -f -
-        envsubst < frontend-deployment-canary.yaml | kubectl apply -f -
-
-        # Apply services
-        kubectl apply -f backend-service-production.yaml
-        kubectl apply -f frontend-service-production.yaml
-
-        # Wait for canary to be ready
-        kubectl wait --for=condition=available --timeout=300s \
-            deployment/backend-deployment-canary
-        kubectl wait --for=condition=available --timeout=300s \
-            deployment/frontend-deployment-canary
-
-        echo "Canary deployment ready"
-        echo "Monitoring canary for issues..."
-
-        # Monitor canary for 2 minutes
-        sleep 120
-
-        # Check canary health
-        CANARY_BACKEND_READY=\$(kubectl get deployment backend-deployment-canary -o jsonpath='{.status.readyReplicas}')
-        CANARY_FRONTEND_READY=\$(kubectl get deployment frontend-deployment-canary -o jsonpath='{.status.readyReplicas}')
-
-        if [ "\${CANARY_BACKEND_READY}" -lt "1" ] || [ "\${CANARY_FRONTEND_READY}" -lt "1" ]; then
-            echo "ERROR: Canary is not healthy! Rolling back..."
-            kubectl delete -f backend-deployment-canary.yaml || true
-            kubectl delete -f frontend-deployment-canary.yaml || true
-            exit 1
-        fi
-
-        echo "Canary is healthy"
-        kubectl get pods -l version=canary
-    """
-
-    // Prompt for promotion
-    input message: "Canary deployment is healthy. Promote to production?", ok: 'Promote'
-
-    sh """
-        echo "Promoting canary to production..."
-
-        # Update blue deployment with canary image
-        kubectl set image deployment/backend-deployment-blue \
-            backend=${BACKEND_IMAGE} --record
-        kubectl set image deployment/frontend-deployment-blue \
-            frontend=${FRONTEND_IMAGE} --record
-
-        # Wait for rollout
-        kubectl rollout status deployment/backend-deployment-blue --timeout=300s
-        kubectl rollout status deployment/frontend-deployment-blue --timeout=300s
-
-        # Remove canary
-        kubectl delete deployment backend-deployment-canary || true
-        kubectl delete deployment frontend-deployment-canary || true
-
-        echo "Canary promoted successfully"
-    """
 }

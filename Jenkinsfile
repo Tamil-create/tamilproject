@@ -1,7 +1,5 @@
 // Employee Management System - ECS CI/CD Jenkinsfile
 // Flow: GitHub -> Webhook -> Jenkins -> Build/Test -> Docker -> ECR -> ECS
-// IMPORTANT: Verify ECS_BACKEND_SERVICE, ECS_FRONTEND_SERVICE and the container
-// names against the actual ECS service/task definitions before running.
 
 pipeline {
     agent any
@@ -293,9 +291,9 @@ pipeline {
                                 --query 'taskDefinition' > "\${FILE}.source.json"
 
                             jq --arg IMAGE "\${NEW_IMAGE}" --arg CONTAINER "\${CONTAINER}" '
-                                if any(.containerDefinitions[]; .name == $CONTAINER)
+                                if any(.containerDefinitions[]; .name == \$CONTAINER)
                                 then del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy)
-                                     | .containerDefinitions |= map(if .name == $CONTAINER then .image = $IMAGE else . end)
+                                     | .containerDefinitions |= map(if .name == \$CONTAINER then .image = \$IMAGE else . end)
                                 else error("Container name not found in task definition")
                                 end
                             ' "\${FILE}.source.json" > "\${FILE}.json"
@@ -317,7 +315,7 @@ pipeline {
                                 --output text
 
                             echo "\${NEW_TASK_DEF}" > "\${FILE}.new-td"
-                        }
+                        }  
 
                         deploy_ecs_service \\
                             "${ECS_BACKEND_SERVICE}" \\
@@ -375,7 +373,7 @@ pipeline {
         always {
             script {
                 echo 'Cleaning up...'
-                sh '''
+                sh """
                     # Remove local Docker images
                     docker rmi ${BACKEND_IMAGE} || true
                     docker rmi ${FRONTEND_IMAGE} || true
@@ -384,13 +382,13 @@ pipeline {
 
                     # Clean up docker system
                     docker system prune -f || true
-                '''
+                """
             }
         }
         success {
             echo 'Pipeline completed successfully!'
             script {
-                sh '''
+                sh """
                     echo "========================================="
                     echo "Deployment Summary"
                     echo "========================================="
@@ -399,13 +397,13 @@ pipeline {
                     echo "Frontend Image: ${FRONTEND_IMAGE}"
                     echo "========================================="
 
-                    aws ecs describe-services \
-                        --cluster ${ECS_CLUSTER_NAME} \
-                        --services ${ECS_BACKEND_SERVICE} ${ECS_FRONTEND_SERVICE} \
-                        --region ${AWS_REGION} \
-                        --query 'services[].{Service:serviceName,Status:status,Desired:desiredCount,Running:runningCount}' \
+                    aws ecs describe-services \\
+                        --cluster ${ECS_CLUSTER_NAME} \\
+                        --services ${ECS_BACKEND_SERVICE} ${ECS_FRONTEND_SERVICE} \\
+                        --region ${AWS_REGION} \\
+                        --query 'services[].{Service:serviceName,Status:status,Desired:desiredCount,Running:runningCount}' \\
                         --output table
-                '''
+                """
             }
         }
         failure {
